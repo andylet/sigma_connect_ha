@@ -80,7 +80,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             )
             pin = (user_input.get(CONF_PIN) or "").strip()
             user_input[CONF_PIN] = pin
-            user_input[CONF_PIN] = pin
+            user_input["partition_2_pin"] = user_input.get("partition_2_pin", "").strip()
             return self.async_create_entry(title="", data=user_input)
 
         opts = self._entry.options
@@ -91,6 +91,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_UPDATE_INTERVAL,
                 default=opts.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             ): vol.All(vol.Coerce(float), vol.Range(min=1.0)),
+            vol.Optional(
+                CONF_ENABLE_ANALYTICS,
+                default=opts.get(CONF_ENABLE_ANALYTICS, DEFAULT_ENABLE_ANALYTICS),
+            ): bool,
         })
 
         return self.async_show_form(step_id="init", data_schema=schema)

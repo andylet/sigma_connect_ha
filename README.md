@@ -185,46 +185,37 @@ If you find this project helpful and want to support my work, feel free to donat
 
 [https://paypal.me/amaziotis](https://paypal.me/amaziotis)
 
-
 ## Two PIN-scoped partitions (Aeolus / Ixion)
 
-An optional **Partition 2 PIN** setting enables a second alarm entity and its zone
-status/bypass sensors. The existing alarm entity and sensor unique IDs are kept
-for partition 1. Leave the second PIN empty to use one partition.
+Set the optional Partition 2 PIN to enable a separate alarm entity and zone
+status/bypass sensors. Leave it empty to retain the original single-PIN client.
+Existing partition 1 entity IDs are preserved. Start with 60-second polling.
 
-1. Keep the existing integration entry and configure the partition 1 keypad PIN.
-2. Enter the keypad PIN for partition 2 in the new optional field.
-3. Set the status check interval to **60 seconds** initially and restart Home Assistant.
-4. Verify both partition states and zone assignments before testing control.
+The optional client serializes access through one session, authenticates with the
+requested PIN, verifies partition identity, and reuses the upstream action retry
+and confirmation flow. A fully armed partition cannot be changed directly to
+perimeter mode; disarming remains an explicit user action.
 
-Access is serialized through one web session. Switching partitions re-authenticates
-with the corresponding PIN. The integration verifies the partition number on the
-status and control pages before sending a command, and follows the advertised
-arm/disarm/stay link. A control request is sent once, followed by status verification.
-An uncertain result raises an error rather than automatically repeating the command.
+Alarm-state confirmation is separate from zone-table readiness. After control,
+zone entities may briefly be unavailable until a complete zones read succeeds;
+missing data is not reported as closed zones. Failed reads use the existing
+failure grace period. The next successful complete read restores zone entities.
 
-Both partitions must be readable during initial setup. A later failure reading
-partition 2 makes its entities unavailable while retaining fresh partition 1 data.
-Battery and AC power remain shared sensors read from partition 1.
+The analytics setting remains available and uses the upstream settings allowlist;
+partition PINs are excluded from that payload.
 
-Analytics are disabled by this implementation; partition PIN options must not enter
-usage reports. Disabling partition 2 can leave inactive registry entities that may
-be removed manually. Close other Ixion web/app sessions while diagnosing logouts.
+### Test status (October 31, 2026)
 
-### Validation and limitations
+The user reports generally good daily operation on Aeolus 11.7 / Ixion 1.4.0,
+Home Assistant Core 2026.10.1, two PINs, and wired Ethernet to the router.
+Command delays of a few seconds are acceptable; transient unavailability after
+actions recovers in about five seconds. Intermittent session expiration, timeouts,
+and empty zone tables remain in the logs, including some failed reads.
+This is a test version, not a claim of full stability or other-firmware validation.
+Triggered-state detection is not added.
 
-A user reports independent arm/disarm operation on **Aeolus 11.7 / Ixion 1.4.0**
-with **Home Assistant Core 2026.10.1** and separate partition PINs. Intermittent
-unavailability was observed at a short polling interval; the user reports improvement
-at 60 seconds. Long-term stability and other firmware combinations are unverified.
-Alarm-triggered state detection is not added by this change.
-
-Run the isolated protocol regression tests with:
-
-```sh
-python tests/standalone/test_partition_protocol.py
-```
-
-These tests use synthetic HTML and mocked requests, not credentials or exported
-pages from a real installation. They do not replace the existing Home Assistant
-test suite or an on-device test.
+Locally, all 193 tests pass on Windows/Python 3.12 with Home Assistant 2024.3.3
+and the repository compatibility setup. Three AsyncMock warnings remain in the
+test scaffolding. Tests use synthetic responses, not private installation HTML.
+Run the complete suite with `pytest tests/`; standalone protocol tests also run
+with `python tests/standalone/test_partition_protocol.py`.

@@ -6,13 +6,15 @@ from homeassistant.components.alarm_control_panel import (
 )
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
+from .sigma_client import ActionNotAllowedError
+from homeassistant.exceptions import HomeAssistantError
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
     """Create the Sigma alarm control‑panel entity."""
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    async_add_entities([SigmaAlarmPanel(coordinator, entry, part)
-                        for part in coordinator.partition_ids])
+    parts = getattr(coordinator, "partition_ids", ("1",))
+    async_add_entities([SigmaAlarmPanel(coordinator, entry, part) for part in parts])
 
 
 class SigmaAlarmPanel(CoordinatorEntity, AlarmControlPanelEntity):
@@ -82,16 +84,54 @@ class SigmaAlarmPanel(CoordinatorEntity, AlarmControlPanelEntity):
 
     @property
     def available(self):
-        return super().available and (
-            self.partition == "1" or
-            (self.coordinator.data or {}).get("partition_2") is not None
-        )
+        data = self.coordinator.data or {}
+        if self.partition == "2":
+            data = data.get("partition_2")
+        return super().available and data is not None and data.get("available", True)
+
+    async def _async_action(self, action):
+        # Shared by both partition entities, before occupying an executor thread.
+        if getattr(self.coordinator, "_action_in_progress", False) is True:
+            raise HomeAssistantError(
+                "Another Sigma alarm command is in progress; wait for it to finish"
+            )
+        self.coordinator._action_in_progress = True
+        # Keep ownership until the executor actually stops, even if the service
+        # caller is cancelled. Retain the task and consume a possible late error.
+        task = asyncio.create_task(self._async_execute_action(action))
+        self.coordinator._action_task = task
+        task.add_done_callback(self._action_finished)
+        return await asyncio.shield(task)
+
+    def _action_finished(self, task):
+        if self.coordinator._action_task is task:
+            self.coordinator._action_task = None
+        if not task.cancelled():
+            task.exception()
+
+    async def _async_execute_action(self, action):
+        try:
+            if getattr(self.coordinator, "partition_ids", ("1",)) == ("1", "2"):
+                result = await self.hass.async_add_executor_job(
+                    self.coordinator.client.perform_partition_action, action, self.partition
+                )
+                if not result:
+                    raise HomeAssistantError("Ixion did not confirm the requested alarm state")
+            else:
+                await self.hass.async_add_executor_job(
+                    self.coordinator.client.perform_action, action
+                )
+        except ActionNotAllowedError as error:
+            raise HomeAssistantError(str(error)) from error
+        finally:
+            self.coordinator._action_in_progress = False
+            self.hass.async_create_task(self.coordinator.async_request_refresh())
 
     async def async_alarm_disarm(self, code=None):
-        await self.coordinator.async_partition_action("disarm", self.partition)
+        await self._async_action("disarm")
 
     async def async_alarm_arm_away(self, code=None):
-        await self.coordinator.async_partition_action("arm", self.partition)
+        await self._async_action("arm")
 
     async def async_alarm_arm_home(self, code=None):
-        await self.coordinator.async_partition_action("stay", self.partition)
+        await self._async_action("stay")

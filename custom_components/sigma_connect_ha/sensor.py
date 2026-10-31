@@ -38,6 +38,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 entry,
                 f"Zone {zid} - {name} Status",
                 lambda d, zid=zid: next(z for z in d["zones"] if z["zone"] == zid)["status"],
+                requires_zones=True,
             )
         )
         sensors.append(
@@ -46,6 +47,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 entry,
                 f"Zone {zid} - {name} Bypass",
                 lambda d, zid=zid: next(z for z in d["zones"] if z["zone"] == zid)["bypass"],
+                requires_zones=True,
             )
         )
 
@@ -64,15 +66,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
                     f"Partition 2 Zone {zid} - {zone['description']} {label}",
                     lambda d, zid=zid, key=key: next(
                         (z.get(key) for z in (d.get("partition_2") or {}).get("zones", [])
-                         if z["zone"] == zid), None), partition="2"))
+                         if z["zone"] == zid), None), partition="2", requires_zones=True))
     async_add_entities(sensors)
 
 
 class SigmaSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, entry, name, value_fn, unit=None, partition="1"):
+    def __init__(self, coordinator, entry, name, value_fn, unit=None, partition="1", requires_zones=False):
         super().__init__(coordinator)
         self.entry = entry
         self.partition = partition
+        self._requires_zones = requires_zones
         self._attr_name = f"Sigma {name}"
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{name.lower().replace(' ', '_')}"
         self._value_fn = value_fn
@@ -80,6 +83,10 @@ class SigmaSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self):
+        data = self.coordinator.data or {}
+        part = data if self.partition == "1" else (data.get("partition_2") or {})
+        if self._requires_zones and not part.get("zones_available", True):
+            return None
         try:
             return self._value_fn(self.coordinator.data or {})
         except (KeyError, StopIteration):
@@ -87,10 +94,11 @@ class SigmaSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self):
-        return super().available and (
-            self.partition == "1" or
-            (self.coordinator.data or {}).get("partition_2") is not None
-        )
+        data = self.coordinator.data or {}
+        if self.partition == "2":
+            data = data.get("partition_2")
+        return (super().available and data is not None and data.get("available", True)
+                and (not self._requires_zones or data.get("zones_available", True)))
 
     @property
     def device_info(self):
