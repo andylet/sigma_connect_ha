@@ -158,7 +158,192 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.panel.commands, [])
 
     async def test_actions_reuse_upstream_loop_and_preserve_other_partition(self):
-        ok = await asyncio.to_thread(self.client.perform_partition_action, "arm",…2698 tokens truncated…    self.panel.get, self.panel.post = get, post
+        ok = await asyncio.to_thread(self.client.perform_partition_action, "arm", "2")
+        self.assertTrue(ok)
+        await asyncio.sleep(0)
+        self.assertEqual(self.panel.commands, [("2", "arm")])
+        self.assertEqual(self.panel.states["1"], "AΦOΠΛIΣMENO")
+        self.assertEqual(self.coordinator.updates[-1][0], "2")
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_expired_action_redirect_recovers(self):
+        self.panel.expire_on_command = True
+        ok = await asyncio.to_thread(self.client.perform_partition_action, "arm", "2")
+        self.assertTrue(ok)
+        self.assertEqual(self.panel.commands, [("2", "arm")])
+        self.assertGreaterEqual(self.panel.logins, 2)
+
+    async def test_command_network_failure_uses_upstream_retry(self):
+        original = self.panel.get
+        failed = False
+        def get(url, **kwargs):
+            nonlocal failed
+            if url.endswith("/arm") and not failed:
+                failed = True
+                raise ConnectionError("simulated network failure")
+            return original(url, **kwargs)
+        self.panel.get = get
+        self.assertTrue(await asyncio.to_thread(self.client.perform_partition_action, "arm", "2"))
+        self.assertGreaterEqual(self.panel.logins, 2)
+        self.assertEqual(self.panel.commands, [("2", "arm")])
+
+    async def test_disarm_uses_confirmed_control_headers_when_zone_table_is_empty(self):
+        self.panel.states["2"] = "\u039f\u03a0\u039b\u0399\u03a3\u039c\u0395\u039d\u039f"
+        other_partition = self.panel.states["1"]
+        original = self.panel.get
+        def get(url, **kwargs):
+            if url.endswith("/zones.html"):
+                return Response(html("2", kind="panel") + '<table class="normaltable"><tr><th>Zone</th></tr></table>')
+            return original(url, **kwargs)
+        self.panel.get = get
+        with patch.object(self.panel, "get", wraps=self.panel.get) as calls:
+            self.assertTrue(await asyncio.to_thread(self.client.perform_partition_action, "disarm", "2"))
+        await asyncio.sleep(0)
+        paths = [call.args[0].rsplit("/", 1)[-1] for call in calls.call_args_list]
+        self.assertNotIn("zones.html", paths)
+        self.assertEqual(paths.count("panel.html"), 3)
+        self.assertEqual(paths.count("access.html"), 1)
+        self.assertEqual(self.panel.commands, [("2", "disarm")])
+        self.assertEqual(self.panel.states["1"], other_partition)
+        self.assertEqual(self.panel.logins, 1)
+        published = self.coordinator.updates[-1][1]
+        self.assertEqual(published["status"], "Disarmed")
+        self.assertEqual(published["zones"], [])
+        self.assertIs(published["zones_available"], False)
+        self.assertNotIn(unittest.mock.call(1.0), base_module.time.sleep.call_args_list)
+        self.assertNotIn(unittest.mock.call(2.0), base_module.time.sleep.call_args_list)
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_wrong_partition_control_header_never_sends_command(self):
+        original = self.panel.get
+        states_before = self.panel.states.copy()
+        def get(url, **kwargs):
+            if url.endswith("/access.html"):
+                return Response(html("1"), "access.html")
+            return original(url, **kwargs)
+        self.panel.get = get
+        with patch(PKG + ".sigma_client.MAX_ACTION_ATTEMPTS", 1):
+            self.assertFalse(await asyncio.to_thread(self.client.perform_partition_action, "arm", "2"))
+        await asyncio.sleep(0)
+        self.assertEqual(self.panel.commands, [])
+        self.assertEqual(self.panel.states, states_before)
+        self.assertEqual(self.coordinator.updates, [])
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_unknown_or_authenticated_form_control_page_never_sends_command(self):
+        original = self.panel.get
+        pages = {
+            "unknown_state": html("2", state="UNRECOGNIZED STATE"),
+            "web_login": html("2") + '<form action="login.html"><input name="username" value="PRIVATE_USER"><input name="password" value="PRIVATE_PASS"><input name="gen_input" value="PRIVATE_TOKEN"></form>',
+            "pin": html("2") + '<form action="ucode"><input name="password" value="PRIVATE_PIN"><input name="gen_input" value="PRIVATE_TOKEN"></form>',
+        }
+        for kind, page in pages.items():
+            with self.subTest(kind=kind):
+                self.panel.get = original
+                def get(url, **kwargs):
+                    if url.endswith("/access.html"):
+                        return Response(page, "access.html")
+                    return original(url, **kwargs)
+                self.panel.get = get
+                with patch(PKG + ".sigma_client.MAX_ACTION_ATTEMPTS", 1):
+                    self.assertFalse(await asyncio.to_thread(self.client.perform_partition_action, "arm", "2"))
+                await asyncio.sleep(0)
+                self.assertEqual(self.panel.commands, [])
+                self.assertEqual(self.coordinator.updates, [])
+                self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_wrong_partition_after_command_cannot_confirm_success(self):
+        original_get, original_post = self.panel.get, self.panel.post
+        def get(url, **kwargs):
+            if url.endswith("/panel.html") and self.panel.commands:
+                return Response(html("1", state=self.panel.states["2"]), "panel.html")
+            return original_get(url, **kwargs)
+        def post(url, data, **kwargs):
+            if url.endswith("/part.cgi") and self.panel.commands:
+                return Response(html("1", state=self.panel.states["2"]), "part.cgi")
+            return original_post(url, data, **kwargs)
+        self.panel.get, self.panel.post = get, post
+        with patch(PKG + ".sigma_client.MAX_ACTION_ATTEMPTS", 1), \
+                patch.object(self.client, "POLLS_PER_ATTEMPT", 2):
+            self.assertFalse(await asyncio.to_thread(self.client.perform_partition_action, "arm", "2"))
+        await asyncio.sleep(0)
+        self.assertEqual(self.panel.commands, [("2", "arm")])
+        self.assertEqual(self.coordinator.updates, [])
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_unaccepted_disarm_does_not_publish_false_success(self):
+        self.panel.states["2"] = "\u039f\u03a0\u039b\u0399\u03a3\u039c\u0395\u039d\u039f"
+        armed = self.panel.states["2"]
+        original = self.panel.get
+        def get(url, **kwargs):
+            if url.endswith("/disarm"):
+                self.panel.commands.append((self.panel.part, "disarm"))
+                return Response(html(self.panel.part, kind="panel", state=armed), "disarm")
+            return original(url, **kwargs)
+        self.panel.get = get
+        with patch(PKG + ".sigma_client.MAX_ACTION_ATTEMPTS", 1), \
+                patch.object(self.client, "POLLS_PER_ATTEMPT", 2):
+            self.assertFalse(await asyncio.to_thread(self.client.perform_partition_action, "disarm", "2"))
+        await asyncio.sleep(0)
+        self.assertEqual(self.panel.commands, [("2", "disarm")])
+        self.assertEqual(self.panel.states["2"], armed)
+        self.assertEqual(self.coordinator.updates, [])
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_already_disarmed_publishes_fresh_confirmation_without_command(self):
+        self.coordinator.updates.append(("2", {"status": "Armed", "zones_available": True,
+                                                "zones": [{"zone_id": 21, "status": "Closed"}]}))
+        with patch.object(self.panel, "get", wraps=self.panel.get) as calls:
+            self.assertTrue(await asyncio.to_thread(self.client.perform_partition_action, "disarm", "2"))
+        await asyncio.sleep(0)
+        self.assertEqual(self.panel.commands, [])
+        self.assertEqual(len(self.coordinator.updates), 2)
+        part, published = self.coordinator.updates[-1]
+        self.assertEqual(part, "2")
+        self.assertEqual(published["status"], "Disarmed")
+        self.assertEqual(published["zones"], [])
+        self.assertIs(published["zones_available"], False)
+        paths = [call.args[0].rsplit("/", 1)[-1] for call in calls.call_args_list]
+        self.assertNotIn("access.html", paths)
+        self.assertNotIn("zones.html", paths)
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_single_partition_already_desired_does_not_overwrite_zone_data(self):
+        # The original client historically returns early without publishing an empty table.
+        base = base_module.SigmaClient("http://alarm.example:5053", "example", "example", "1111",
+                                       self.coordinator, send_analytics=False)
+        base.session.close()
+        base.session = self.panel
+        base._session_authenticated = True
+        self.panel.auth = True
+        original = self.panel.get
+        def get(url, **kwargs):
+            if url.endswith("/zones.html"):
+                return Response(html("1", kind="panel"), "zones.html")
+            return original(url, **kwargs)
+        self.panel.get = get
+        existing = ("1", {"status": "Disarmed", "zones": [{"zone_id": 1, "status": "Closed"}]})
+        self.coordinator.updates.append(existing)
+        with patch.object(base, "_publish_action_data") as publish:
+            self.assertTrue(await asyncio.to_thread(base.perform_action, "disarm"))
+        await asyncio.sleep(0)
+        publish.assert_not_called()
+        self.assertEqual(self.coordinator.updates, [existing])
+        self.assertEqual(self.panel.commands, [])
+        self.assertFalse(self.coordinator.lock.locked())
+
+    async def test_headerless_control_pages_use_authoritative_zones_fallback(self):
+        self.panel.explicit_selection = True
+        original_get, original_post = self.panel.get, self.panel.post
+        headerless = '<a href="zones.html">Zones</a><a href="/arm">Arm</a><a href="/disarm">Disarm</a><a href="/stay">Stay</a>'
+        def get(url, **kwargs):
+            if url.endswith("/access.html"):
+                return Response(headerless, "access.html")
+            return original_get(url, **kwargs)
+        def post(url, data, **kwargs):
+            result = original_post(url, data, **kwargs)
+            return Response(headerless, "part.cgi") if url.endswith("/part.cgi") else result
+        self.panel.get, self.panel.post = get, post
         with patch.object(self.panel, "get", wraps=self.panel.get) as calls:
             self.assertTrue(await asyncio.to_thread(self.client.perform_partition_action, "arm", "2"))
         await asyncio.sleep(0)
